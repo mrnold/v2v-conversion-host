@@ -33,7 +33,7 @@ import time
 
 from .singleton import State
 from .common import error, hard_error, log_command_safe
-from .hosts import BaseHost, CNVHost
+from .hosts import BaseHost, CNVHost, SourceHost
 from .runners import SystemdRunner
 from .log_parser import log_parser
 from .checks import CHECKS
@@ -235,12 +235,13 @@ def throttling_update(runner, initial=None):
     logging.info('New throttling setup: %r', state['throttling'])
 
 
-def wrapper(host, data, v2v_caps, agent_sock=None):
+def wrapper(host, data, v2v_caps, agent_sock=None, source=None):
 
     state = State().instance
     v2v_args, v2v_env = prepare_command(data, v2v_caps, agent_sock)
     v2v_args, v2v_env = host.prepare_command(
         data, v2v_args, v2v_env, v2v_caps)
+    source.prepare_exports(v2v_env, agent_sock)
 
     logging.info('Starting virt-v2v:')
     log_command_safe(v2v_args, v2v_env)
@@ -283,6 +284,12 @@ def wrapper(host, data, v2v_caps, agent_sock=None):
     if state['return_code'] != 0:
         state['failed'] = True
     state.write()
+
+    try:
+        source.close_exports()
+    except Exception as error:
+        logging.info('Error closing source volume exports: {}', error)
+        logging.info('This may require manual cleanup.')
 
 
 def write_password(password, password_files, uid, gid):
@@ -393,6 +400,8 @@ def main():
 
     host_type = BaseHost.detect(data)
     host = BaseHost.factory(host_type)
+    source_host_type = SourceHost.detect(data)
+    source_host = SourceHost.factory(source_host_type, data)
 
     # The logging is delayed until we now which user runs the wrapper.
     # Otherwise we would have two logs.
@@ -566,7 +575,8 @@ def main():
                     data, host.get_uid(), host.get_gid())
                 if agent_pid is None:
                     raise RuntimeError('Failed to start ssh-agent')
-            wrapper(host, data, virt_v2v_caps, agent_sock)
+
+            wrapper(host, data, virt_v2v_caps, agent_sock, source_host)
             if agent_pid is not None:
                 os.kill(agent_pid, signal.SIGTERM)
             if not state.get('failed', False):
