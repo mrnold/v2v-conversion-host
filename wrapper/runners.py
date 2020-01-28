@@ -21,12 +21,16 @@ else:
 class BaseRunner(object):
 
     def __init__(self, host, arguments, environment, log):
+        self._command = VIRT_V2V
         self._arguments = arguments
         self._environment = environment
         self._host = host
         self._log = log
         self._pid = None
         self._return_code = None
+
+    def change_command(self, command):
+        self._command = command
 
     def is_running(self):
         """ Returns True if process is still running """
@@ -71,7 +75,7 @@ class SubprocessRunner(BaseRunner):
     def run(self):
         with open(self._log, 'w') as log:
             self._proc = subprocess.Popen(
-                    [VIRT_V2V] + self._arguments,
+                    [self._command] + self._arguments,
                     stdin=DEVNULL,
                     stderr=subprocess.STDOUT,
                     stdout=log,
@@ -120,8 +124,8 @@ class SystemdRunner(BaseRunner):
         unit.extend([
             'cgexec', '-g', 'net_cls:%s' % net_cls_dir,
             '/bin/sh', '-c',
-            'exec "%s" "$@" > "%s" 2>&1' % (VIRT_V2V, self._log),
-            VIRT_V2V])  # First argument is command name
+            'exec "%s" "$@" > "%s" 2>&1' % (self._command, self._log),
+            self._command])  # First argument is command name
         logging.info('systemd-run invocation: %r', unit)
         unit.extend(self._arguments)
 

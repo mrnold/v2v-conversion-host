@@ -17,6 +17,7 @@ from six.moves.urllib.parse import urlparse
 from .common import error, hard_error, log_command_safe
 from .runners import SubprocessRunner, SystemdRunner
 from .singleton import State
+from .skippers import Skipper
 
 
 TIMEOUT = 300
@@ -283,7 +284,8 @@ class OSPHost(BaseHost):
             return SubprocessRunner(self, *args, **kwargs)
 
     def get_logs(self):
-        log_dir = '/var/log/virt-v2v'
+        #log_dir = '/var/log/virt-v2v'
+        log_dir = 'var/log/virt-v2v'
         if not os.path.isdir(log_dir):
             os.makedirs(log_dir)
         return (log_dir, log_dir)
@@ -532,7 +534,7 @@ class OSPHost(BaseHost):
             if not osp_arg_re.match(k[:3]):
                 hard_error('found invalid key in OSP environment: %s' % k)
         if 'osp_guest_id' not in data:
-            data['osp_guest_id'] = uuid.uuid4()
+            data['osp_guest_id'] = str(uuid.uuid4())
         if not isinstance(data['osp_security_groups_ids'], list):
             hard_error('osp_security_groups_ids must be a list')
         for mapping in data['network_mappings']:
@@ -954,175 +956,3 @@ class VDSMHost(BaseHost):
         except IOError:
             error('Failed to read domain metadata', exception=True)
         return False
-
-
-class SourceHost(object):
-    TYPE_UNKNOWN = 'unknown'
-    TYPE_OSP = 'osp'
-    TYPE = TYPE_UNKNOWN
-
-    @staticmethod
-    def detect(data):
-        if 'osp_source_environment' in data:
-            return SourceHost.TYPE_OSP
-        else:
-            return SourceHost.TYPE_UNKNOWN
-
-    @staticmethod
-    def factory(source_host_type, data):
-        if source_host_type == SourceHost.TYPE_OSP:
-            return OSPSourceHost(data)
-        return SourceHost()
-
-    def prepare_exports(self, v2v_env, agent_sock):
-        logging.debug('No preparation needed for this migration source.')
-
-    def close_exports(self):
-        logging.debug('No cleanup needed for this migration source.')
-
-
-class OSPSourceHost(SourceHost):
-    def prepare_exports(self, v2v_env, agent_sock):
-        self._test_ssh_connection()
-        self._shutdown_source_vm()
-        self.root_volume_id, self.data_volume_ids = \
-                self._get_root_and_data_volumes()
-        self.root_volume_copy, self.root_snapshot = \
-                self._detach_data_volumes_from_source()
-        self._attach_volumes_to_converter()
-        self._export_volumes_from_converter()
-        self.exported = True
-
-    def close_exports(self):
-        if self.exported:
-            self._test_ssh_connection()
-            self._converter_close_exports()
-            self._detach_volumes_from_converter(self.data_volume_ids)
-            self._attach_data_volumes_to_source(self.data_volume_ids,
-                    self.root_volume_copy, self.root_snapshot)
-            self.exported = False
-
-    def __init__(self, data):
-        osp_env = data['osp_source_environment']
-        osp_arg_list = ["auth_url", "username", "password",
-                        "project_name", "project_domain_name",
-                        "user_domain_name", "verify"]
-        osp_args = {arg: osp_env[arg] for arg in osp_arg_list}
-        self.source_converter = osp_env['conversion_vm_id']
-        self.source_instance = osp_env['vm_id']
-        self.conn = openstack.connect(**osp_args)
-
-    def _source_vm(self):
-        """
-        Changes to the VM returned by get_server_by_id are not necessarily
-        reflected in existing objects, so just get a new one every time.
-        """
-        return self.conn.get_server_by_id(self.source_instance)
-
-    def _converter(self):
-        return self.conn.get_server_by_id(self.source_converter)
-
-    def _test_ssh_connection(self):
-        pass
-
-    def _shutdown_source_vm(self):
-        server = self.conn.compute.get_server(self._source_vm().id)
-        if server.status != 'SHUTOFF':
-            self.conn.compute.stop_server(server=server)
-            logging.debug('Waiting 300s for source VM to stop...')
-            self.conn.compute.wait_for_server(server, 'SHUTOFF', wait=300)
-
-    def _detach_data_volumes_from_source(self):
-        """
-        Detach data volumes from source VM, and pretend to "detach" the boot
-        volume by creating a new volume from a snapshot of the VM.
-        """
-        sourcevm = self._source_vm()
-
-        # Detach non-root volumes
-        for volume in self.data_volume_ids:
-            v = self.conn.get_volume_by_id(volume)
-            logging.debug('Detaching %s from %s', volume, sourcevm.id)
-            self.conn.detach_volume(server=sourcevm, volume=v, wait=True)
-
-        # Create a snapshot of the root volume
-        logging.debug('Creating root device snapshot')
-        root_snapshot = self.conn.create_volume_snapshot(force=True, wait=True,
-                name="rhosp-migration-{}".format(self.root_volume_id),
-                volume_id=self.root_volume_id)
-
-        # Create a new volume from the snapshot
-        logging.debug('Creating new volume from root snapshot')
-        root_volume_copy = self.conn.create_volume(wait=True,
-                snapshot_id=root_snapshot.id,
-                size=root_snapshot.size)
-        return root_volume_copy, root_snapshot
-
-    def _get_root_and_data_volumes(self):
-        root_volume_id = None
-        data_volume_ids = []
-        for volume in self._source_vm().volumes:
-            logging.debug('Inspecting volume: %s', volume['id'])
-            v = self.conn.volume.get_volume(volume['id'])
-            for attachment in v.attachments:
-                if attachment['server_id'] == self._source_vm().id:
-                    if attachment['device'] == '/dev/vda':
-                        logging.debug('Assuming this volume is the root disk')
-                        root_volume_id = attachment['volume_id']
-                    else:
-                        logging.debug('Assuming this is a data volume')
-                        data_volume_ids.append(attachment['volume_id'])
-                else:
-                    logging.debug('Attachment is not part of current VM?')
-        return root_volume_id, data_volume_ids
-
-    def _attach_volumes_to_converter(self):
-        """ Attach all the source volumes to the conversion host """
-        conversion_volume_ids = [self.root_volume_copy.id]+self.data_volume_ids
-        for volume_id in conversion_volume_ids:
-            volume = self.conn.get_volume_by_id(volume_id)
-            logging.debug('Attaching %s to conversion host...', volume_id)
-            self.conn.attach_volume(server=self._converter(), volume=volume)
-
-    def _export_volumes_from_converter(self):
-        """ SSH to source conversion host and start an NBD export """
-        logging.debug('Exporting volumes from source conversion host...')
-
-    def _converter_close_exports(self):
-        """ SSH to source conversion host and close the NBD export """
-        logging.debug('Stopping export from source conversion host...')
-
-    def _detach_volumes_from_converter(self):
-        """ Detach volumes from conversion host """
-        for volume in self._converter().volumes:
-            logging.debug('Inspecting volume %s', volume["id"])
-            v = self.conn.volume.get_volume(volume["id"])
-            for attachment in v.attachments:
-                if attachment["server_id"] == self._converter().id:
-                    if attachment["device"] == "/dev/vda":
-                        logging.debug('This is the root volume for this VM')
-                    else:
-                        logging.debug('This volume is a data disk for this VM')
-                        self.conn.detach_volume(server=self._converter(),
-                                volume=v, wait=True)
-                        logging.debug('Detached.')
-                else:
-                    logging.debug('Attachment is not part of current VM?')
-
-    def _attach_data_volumes_to_source(self):
-        """ Clean up the copy of the root volume and re-attach data volumes """
-
-        # Delete the copy of the source root disk
-        logging.debug('Removing copy of root volume')
-        self.conn.delete_volume(name_or_id=self.root_volume_copy.id, wait=True)
-        logging.debug('Deleting root device snapshot')
-        self.conn.delete_volume_snapshot(name_or_id=self.root_snapshot.id,
-                wait=True)
-
-        # Attach data volumes back to source VM
-        logging.debug('Re-attaching volumes to source VM...')
-        for volume_id in self.data_volume_ids:
-            volume = self.conn.get_volume_by_id(volume_id)
-            logging.debug('Attaching %s back to source VM...', volume_id)
-            self.conn.attach_volume(volume=volume, wait=True,
-                    server=self._source_vm())

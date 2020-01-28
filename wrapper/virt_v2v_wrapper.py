@@ -32,8 +32,9 @@ import tempfile
 import time
 
 from .singleton import State
+from .skippers import Skipper
 from .common import error, hard_error, log_command_safe
-from .hosts import BaseHost, CNVHost, SourceHost
+from .hosts import BaseHost, CNVHost
 from .runners import SystemdRunner
 from .log_parser import log_parser
 from .checks import CHECKS
@@ -235,18 +236,28 @@ def throttling_update(runner, initial=None):
     logging.info('New throttling setup: %r', state['throttling'])
 
 
-def wrapper(host, data, v2v_caps, agent_sock=None, source=None):
+def wrapper(host, data, v2v_caps, agent_sock=None):
 
     state = State().instance
     v2v_args, v2v_env = prepare_command(data, v2v_caps, agent_sock)
     v2v_args, v2v_env = host.prepare_command(
         data, v2v_args, v2v_env, v2v_caps)
-    source.prepare_exports(v2v_env, agent_sock)
+
+    skipper_type = Skipper.detect(host.TYPE, data)
+    if skipper_type != Skipper.TYPE_NONE:
+        logging.debug('Skipper type is {}', skipper_type)
+        v2v_cmd, py_module = Skipper.get_command()
+        logging.debug('Command to run is: {} ({})', v2v_cmd, py_module)
+        v2v_args = [py_module, state.machine_readable_log,
+            json.dumps(data), state.v2v_log]
+
+    runner = host.create_runner(v2v_args, v2v_env, state.v2v_log)
+    if skipper_type != Skipper.TYPE_NONE:
+        runner.change_command(v2v_cmd)
 
     logging.info('Starting virt-v2v:')
     log_command_safe(v2v_args, v2v_env)
 
-    runner = host.create_runner(v2v_args, v2v_env, state.v2v_log)
     try:
         runner.run()
     except RuntimeError as e:
@@ -263,6 +274,7 @@ def wrapper(host, data, v2v_caps, agent_sock=None, source=None):
         state.write()
         with log_parser(type(host) is CNVHost) as parser:
             while runner.is_running():
+                logging.debug('STATE: {}'.format(state))
                 state = parser.parse(state)
                 state.write()
                 host.update_progress()
@@ -272,9 +284,9 @@ def wrapper(host, data, v2v_caps, agent_sock=None, source=None):
                 'virt-v2v terminated with return code %d',
                 runner.return_code)
             state = parser.parse(state)
-    except Exception:
+    except Exception as e:
         state['failed'] = True
-        error('Error while monitoring virt-v2v', exception=True)
+        error('Error while monitoring virt-v2v: {}'.format(e), exception=True)
         logging.info('Killing virt-v2v process')
         runner.kill()
 
@@ -284,12 +296,6 @@ def wrapper(host, data, v2v_caps, agent_sock=None, source=None):
     if state['return_code'] != 0:
         state['failed'] = True
     state.write()
-
-    try:
-        source.close_exports()
-    except Exception as error:
-        logging.info('Error closing source volume exports: {}', error)
-        logging.info('This may require manual cleanup.')
 
 
 def write_password(password, password_files, uid, gid):
@@ -358,7 +364,7 @@ def virt_v2v_capabilities():
     try:
         out = subprocess.check_output(['virt-v2v', u'--machine-readable'])
         return out.decode('utf-8').split('\n')
-    except subprocess.CalledProcessError:
+    except (subprocess.CalledProcessError, FileNotFoundError):
         logging.exception('Failed to start virt-v2v')
         return None
 
@@ -400,8 +406,6 @@ def main():
 
     host_type = BaseHost.detect(data)
     host = BaseHost.factory(host_type)
-    source_host_type = SourceHost.detect(data)
-    source_host = SourceHost.factory(source_host_type, data)
 
     # The logging is delayed until we now which user runs the wrapper.
     # Otherwise we would have two logs.
@@ -576,7 +580,7 @@ def main():
                 if agent_pid is None:
                     raise RuntimeError('Failed to start ssh-agent')
 
-            wrapper(host, data, virt_v2v_caps, agent_sock, source_host)
+            wrapper(host, data, virt_v2v_caps, agent_sock)
             if agent_pid is not None:
                 os.kill(agent_pid, signal.SIGTERM)
             if not state.get('failed', False):
